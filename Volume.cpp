@@ -56,7 +56,7 @@ extern "C" void dos_partition_enc(void *pp, struct dos_partition *d);
 /*
  * Media directory - stuff that only media_rw user can see
  */
-const char *Volume::MEDIA_DIR           = "/mnt/media_rw";
+const char *Volume::MEDIA_DIR           = "/mnt";//"/mnt/media_rw
 
 /*
  * Fuse directory - location where fuse wrapped filesystems go
@@ -294,6 +294,12 @@ bool Volume::isMountpointMounted(const char *path) {
     FILE *fp;
     char line[1024];
 
+    if (!path)
+    {
+        SLOGE("isMountpointMounted path is NULL !");
+        return false;
+    }
+
     if (!(fp = fopen("/proc/mounts", "r"))) {
         SLOGE("Error opening /proc/mounts (%s)", strerror(errno));
         return false;
@@ -325,9 +331,11 @@ int Volume::mountVol() {
     char decrypt_state[PROPERTY_VALUE_MAX];
     char crypto_state[PROPERTY_VALUE_MAX];
     char encrypt_progress[PROPERTY_VALUE_MAX];
+    char has_ums[PROPERTY_VALUE_MAX];
 
     property_get("vold.decrypt", decrypt_state, "");
     property_get("vold.encrypt_progress", encrypt_progress, "");
+    property_get("ro.factory.hasUMS",has_ums, "false");
 
     /* Don't try to mount the volumes if we have not yet entered the disk password
      * or are in the process of encrypting.
@@ -437,18 +445,29 @@ int Volume::mountVol() {
 
         errno = 0;
         int gid;
-
-        if (Fat::doMount(devicePath, getMountpoint(), false, false, false,
-                AID_MEDIA_RW, AID_MEDIA_RW, 0007, true)) {
-            SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
-            continue;
-        }
+        char mount_point[255]={0};
+        const char *mountpoint = getMountpoint();
+        strcpy(mount_point,mountpoint);
+	    if(!strcmp("true",has_ums))//has UMS function ,set group to AID_SDCARD_RW
+	    {
+		    if (Fat::doMount(devicePath, mount_point, false, false, false,
+					    AID_SYSTEM,AID_SDCARD_RW, 0002, true)) {
+			    SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
+		    }
+	    }
+	    else //do not has ums,set group to AID_MEDIA_RW
+	    {
+		    if (Fat::doMount(devicePath, mount_point, false, false, false,
+					    AID_SYSTEM,AID_MEDIA_RW, 0002, true)) {
+			    SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
+		    }
+	    }
 
         extractMetadata(devicePath);
 
         if (providesAsec && mountAsecExternal() != 0) {
             SLOGE("Failed to mount secure area (%s)", strerror(errno));
-            umount(getMountpoint());
+            umount(mount_point);
             setState(Volume::State_Idle);
             return -1;
         }
@@ -471,6 +490,10 @@ int Volume::mountVol() {
 int Volume::mountAsecExternal() {
     char legacy_path[PATH_MAX];
     char secure_path[PATH_MAX];
+    char has_ums[PROPERTY_VALUE_MAX];
+
+    property_get("ro.factory.hasUMS",has_ums, "false");
+
 
     snprintf(legacy_path, PATH_MAX, "%s/android_secure", getMountpoint());
     snprintf(secure_path, PATH_MAX, "%s/.android_secure", getMountpoint());
@@ -482,9 +505,17 @@ int Volume::mountAsecExternal() {
         }
     }
 
-    if (fs_prepare_dir(secure_path, 0770, AID_MEDIA_RW, AID_MEDIA_RW) != 0) {
-        SLOGW("fs_prepare_dir failed: %s", strerror(errno));
-        return -1;
+    if(!strcmp("true",has_ums))//has UMS function ,set group to AID_SDCARD_RW
+    {
+	    if (fs_prepare_dir(secure_path, 0770, AID_SYSTEM,AID_SDCARD_RW) != 0) {
+		    return -1;
+	    }
+    }
+    else
+    {
+	    if (fs_prepare_dir(secure_path, 0770, AID_SYSTEM,AID_MEDIA_RW) != 0) {
+		    return -1;
+	    }
     }
 
     if (mount(secure_path, SEC_ASECDIR_EXT, "", MS_BIND, NULL)) {
@@ -497,7 +528,7 @@ int Volume::mountAsecExternal() {
 }
 
 int Volume::doUnmount(const char *path, bool force) {
-    int retries = 10;
+    int retries = 150;
 
     if (mDebug) {
         SLOGD("Unmounting {%s}, force = %d", path, force);
@@ -512,18 +543,18 @@ int Volume::doUnmount(const char *path, bool force) {
         int action = 0;
 
         if (force) {
-            if (retries == 1) {
+            if (retries <= 120) {
                 action = 2; // SIGKILL
-            } else if (retries == 2) {
+            } else if (retries <= 130) {
                 action = 1; // SIGHUP
             }
         }
-
-        SLOGW("Failed to unmount %s (%s, retries %d, action %d)",
+		if(retries%10==0)
+		SLOGW("Failed to unmount %s (%s, retries %d, action %d)",
                 path, strerror(errno), retries, action);
 
         Process::killProcessesWithOpenFiles(path, action);
-        usleep(1000*1000);
+        usleep(1000*30);
     }
     errno = EBUSY;
     SLOGE("Giving up on unmount %s (%s)", path, strerror(errno));
@@ -535,6 +566,7 @@ int Volume::unmountVol(bool force, bool revert) {
 
     int flags = getFlags();
     bool providesAsec = (flags & VOL_PROVIDES_ASEC) != 0;
+    revert = mPartIdx == -1 ? false : revert;
 
     if (getState() != Volume::State_Mounted) {
         SLOGE("Volume %s unmount request when not mounted", getLabel());
@@ -561,7 +593,7 @@ int Volume::unmountVol(bool force, bool revert) {
     /* Now that the fuse daemon is dead, unmount it */
     if (doUnmount(getFuseMountpoint(), force) != 0) {
         SLOGE("Failed to unmount %s (%s)", getFuseMountpoint(), strerror(errno));
-        goto fail_remount_secure;
+        //goto fail_remount_secure;
     }
 
     /* Unmount the real sd card */
